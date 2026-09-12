@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LLC Resonant Converter — FHA Design Tool</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0c1012; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #262f34; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ============================================================
+  // Storage locale (sostituisce lo storage Claude — usa localStorage del browser)
+  // Nota: legato all'origine di QUESTO file; riaprendo lo stesso file nello stesso
+  // browser i progetti salvati restano disponibili.
+  // ============================================================
+  window.storage = {
+    async get(key) {
+      const v = window.localStorage.getItem('llc_' + key);
+      if (v === null) throw new Error('not found');
+      return { key, value: v };
+    },
+    async set(key, value) {
+      window.localStorage.setItem('llc_' + key, value);
+      return { key, value };
+    }
+  };
+</script>
+
+<script type="text/babel" data-presets="react,env">
+const { useState, useMemo, useEffect, useLayoutEffect } = React;
+
+// ============================================================
+// MOTORE DI CALCOLO — FHA LLC (Half-Bridge)
+// ============================================================
+
+function gainK(Fx, m, Q) {
+  // Eq. 1, AN 2012-09: K = Fx²(m-1) / sqrt{ (m·Fx²-1)² + Fx²(Fx²-1)²Q²(m-1)² }
+  // Verificata numericamente contro l'esempio di progetto Infineon (Qmax=0.4, m=6.3 -> Fx_min=0.489, Kmax@Q=0.2 -> 1.974)
+  const Fx2 = Fx * Fx;
+  const num = Fx2 * (m - 1);
+  const t1 = m * Fx2 - 1;
+  const t2 = (Fx2 - 1) * Fx * Q * (m - 1);
+  const den = Math.sqrt(t1 * t1 + t2 * t2);
+  return den === 0 ? 0 : num / den;
+}
+
+function findPeak(m, Q, lo = 0.12, hi = 0.999) {
+  const gr = (Math.sqrt(5) - 1) / 2;
+  let a = lo, b = hi;
+  let c = b - gr * (b - a), d = a + gr * (b - a);
+  for (let i = 0; i < 120; i++) {
+    if (gainK(c, m, Q) < gainK(d, m, Q)) a = c; else b = d;
+    if (b - a < 1e-7) break;
+    c = b - gr * (b - a);
+    d = a + gr * (b - a);
+  }
+  const Fx = (a + b) / 2;
+  return { Fx, K: gainK(Fx, m, Q) };
+}
+
+function solveM(targetK, Q, mLo = 1.3, mHi = 20) {
+  const kAtLo = findPeak(mLo, Q).K;
+  const kAtHi = findPeak(mHi, Q).K;
+  if (kAtLo < targetK) return { feasible: false };
+  if (kAtHi > targetK) return { feasible: true, m: mHi, note: 'clamped_upper' };
+  let lo = mLo, hi = mHi;
+  for (let i = 0; i < 90; i++) {
+    const mid = (lo + hi) / 2;
+    const { K } = findPeak(mid, Q);
+    if (K > targetK) lo = mid; else hi = mid;
+  }
+  return { feasible: true, m: (lo + hi) / 2 };
+}
+
+function computeDesign(inp) {
+  try {
+    const VF = inp.rectifier === 'diode' ? 0.7 : 0;
+    const fixed = inp.voutMode === 'fixed';
+    const VoutNom = fixed ? inp.Vout : inp.VoutNom;
+    const VoutMin = fixed ? inp.Vout : inp.VoutMin;
+    const VoutMax = fixed ? inp.Vout : inp.VoutMax;
+
+    if (inp.VinMin <= 0 || inp.VinMax <= inp.VinMin || VoutNom <= 0 || inp.Pout <= 0 || inp.fr <= 0) {
+      return { error: 'Controlla i dati di ingresso: valori nulli, negativi o incoerenti (es. Vin_min >= Vin_max).' };
+    }
+    if (!(inp.mLo > 1) || !(inp.mHi > inp.mLo)) {
+      return { error: 'Range di ricerca di m non valido: serve m_min > 1 e m_max > m_min.' };
+    }
+
+    const n = inp.VinNom / (2 * (VoutNom + VF));
+    const Mfor = (Vin, Vout) => (2 * n * Vout) / Vin;
+    const MmaxReq = Mfor(inp.VinMin, VoutMax);
+    const MminReq = Mfor(inp.VinMax, VoutMin);
+    const Mnom = Mfor(inp.VinNom, VoutNom);
+    const margin = inp.marginEnabled ? inp.marginPct / 100 : 0;
+    const MmaxTarget = MmaxReq * (1 + margin);
+
+    const Io = inp.Pout / VoutNom;
+    const Rac = (8 / (Math.PI * Math.PI)) * n * n * VoutMax * VoutMax / inp.Pout;
+
+    const Qmax = inp.Qmax;
+    const mSolve = solveM(MmaxTarget * 1.02, Qmax, inp.mLo, inp.mHi);
+    if (!mSolve.feasible) {
+      return {
+        error: `Guadagno massimo richiesto (Mmax target = ${MmaxTarget.toFixed(3)}) non raggiungibile nel range di m esplorato (${inp.mLo}–${inp.mHi}) a Qmax=${Qmax}. Prova ad aumentare Qmax, alzare fr, restringere il range Vin, oppure allargare il range di ricerca di m.`
+      };
+    }
+    const m = mSolve.m;
+    const peak = findPeak(m, Qmax);
+    const FxMin = peak.Fx;
+    const Kmax = peak.K;
+
+    const fr = inp.fr * 1000;
+    const Lr = (Qmax * Rac) / (2 * Math.PI * fr);
+    const Cr = 1 / (2 * Math.PI * fr * Qmax * Rac);
+    const Lm = (m - 1) * Lr;
+    const Lp = m * Lr;
+
+    const fsMin = FxMin * fr;
+
+    const Ae = inp.Ae * 1e-6;
+    const NpMin = (n * (VoutNom + VF)) / (4 * fr * inp.Bmax * Ae);
+    let Ns = 1, Np = Math.round(n * Ns);
+    while (Np < NpMin && Ns < 300) { Ns += 1; Np = Math.round(n * Ns); }
+    const nActual = Np / Ns;
+    const Bcheck = (nActual * (VoutNom + VF)) / (4 * fr * Np * Ae);
+
+    const IpriRMS = Math.sqrt(
+      Math.pow(Io / (2 * Math.SQRT2 * nActual), 2) +
+      Math.pow((nActual * (VoutNom + VF)) / (4 * Math.SQRT2 * fr * Lp), 2)
+    );
+    const IsecRMS = (Io * Math.PI) / 4;
+
+    const IpriPk = Math.SQRT2 * IpriRMS;
+    const VmosfetBlock = inp.VinMax;
+    const VcrAcPk = IpriPk / (2 * Math.PI * fr * Cr);
+    const VcrPk = inp.VinMax / 2 + VcrAcPk;
+    const VD = 2 * (VoutNom + VF);
+    const IDrms = (Io * Math.PI) / 4;
+
+    const samples = 10;
+    let worstFx = -Infinity, worstQ = 0;
+    for (let i = 0; i <= samples; i++) {
+      const Qi = (Qmax * i) / samples;
+      const { Fx } = findPeak(m, Qi);
+      if (Fx > worstFx) { worstFx = Fx; worstQ = Qi; }
+    }
+    const zvsOk = worstFx <= FxMin + 1e-4;
+    const zvsMarginPct = ((FxMin - worstFx) / FxMin) * 100;
+
+    return {
+      VF, VoutNom, VoutMin, VoutMax, n, MmaxReq, MminReq, Mnom, MmaxTarget,
+      Io, Rac, m, FxMin, Kmax, fr, Lr, Cr, Lm, Lp, fsMin,
+      NpMin, Np, Ns, nActual, Bcheck, IpriRMS, IsecRMS, IpriPk, VmosfetBlock,
+      VcrAcPk, VcrPk, VD, IDrms, zvsOk, zvsMarginPct, worstQ, Qmax
+    };
+  } catch (e) {
+    return { error: 'Errore di calcolo: ' + e.message };
+  }
+}
+
+// ---- Blocco 11: dimensionamento condensatori di uscita ----
+// I_Cout(t) = (π·Io/2)·sin(ωt) − Io, integrata su un periodo T=1/fr (regola del punto medio, 4000 campioni)
+function computeOutputCapDesign(Io, fr, IcRated, esrSingle) {
+  if (!(Io > 0) || !(fr > 0)) return { error: 'Dati di progetto principale mancanti o non validi.' };
+  if (!(IcRated > 0)) return { error: 'Inserisci la corrente RMS massima ammessa dal singolo condensatore (I_C_rated).' };
+  if (!(esrSingle >= 0)) return { error: 'Inserisci un ESR del singolo condensatore valido (≥ 0).' };
+
+  const T = 1 / fr;
+  const omega = 2 * Math.PI * fr;
+  const steps = 4000;
+  let sumSq = 0;
+  for (let i = 0; i < steps; i++) {
+    const t = ((i + 0.5) / steps) * T;
+    const iC = (Math.PI * Io / 2) * Math.abs(Math.sin(omega * t)) - Io;
+    sumSq += iC * iC;
+  }
+  const IcoutRMS = Math.sqrt(sumSq / steps);
+  const N = Math.max(1, Math.ceil(IcoutRMS / IcRated));
+  // ΔV = ESR_effettivo × ΔI_picco-picco, dove ΔI_pp = max(I_Cout) - min(I_Cout) = (π/2 - 1)Io - (-Io) = (π/2)Io
+  const dVripple = (esrSingle / N) * (Math.PI / 2) * Io;
+
+  return { IcoutRMS, N, dVripple };
+}
+
+// ---- Blocco 12: verifica capacità di commutazione ZVS (tempo morto / Coss) ----
+// Criterio: la carica disponibile dalla corrente di magnetizzazione durante il tempo morto
+// deve essere sufficiente a caricare/scaricare le Coss dei due MOSFET (nodo di switching):
+//   Im_pk · t_dead ≥ 2·Coss·Vin        con Im_pk = Vin/(8·Lm·fs)
+// Vin si semplifica in entrambi i membri -> il criterio equivale a:
+//   Lm_max = t_dead / (16·Coss·fs_max),   fs_max = fr (frequenza massima nel range operativo boost)
+function computeDeadtimeZvs(Lm, fr, VinRef, tDeadNs, CossPf) {
+  if (!(tDeadNs > 0)) return { error: 'Inserisci un tempo morto valido (> 0 ns).' };
+  if (!(CossPf > 0)) return { error: 'Inserisci una Coss valida (> 0 pF).' };
+  const tDead = tDeadNs * 1e-9;
+  const Coss = CossPf * 1e-12;
+  const LmMax = tDead / (16 * Coss * fr);
+  const ok = Lm <= LmMax;
+  const marginPct = ((LmMax - Lm) / LmMax) * 100;
+  const ImPk = VinRef / (8 * Lm * fr);
+  return { LmMax, ok, marginPct, ImPk };
+}
+
+
+// ============================================================
+// FORMATTAZIONE
+// ============================================================
+
+const PREFIXES = [
+  { v: 1e9, s: 'G' }, { v: 1e6, s: 'M' }, { v: 1e3, s: 'k' }, { v: 1, s: '' },
+  { v: 1e-3, s: 'm' }, { v: 1e-6, s: 'µ' }, { v: 1e-9, s: 'n' }, { v: 1e-12, s: 'p' },
+];
+function fmt(value, unit, digits = 3) {
+  if (value === undefined || value === null || !isFinite(value)) return '—';
+  if (value === 0) return `0 ${unit}`;
+  const abs = Math.abs(value);
+  const p = PREFIXES.find(pp => abs >= pp.v) || PREFIXES[PREFIXES.length - 1];
+  return `${(value / p.v).toFixed(digits)} ${p.s}${unit}`;
+}
+function fmtN(value, digits = 3) {
+  if (value === undefined || value === null || !isFinite(value)) return '—';
+  return value.toFixed(digits);
+}
+
+// ============================================================
+// TOKENS / ICONE (SVG inline — nessuna dipendenza esterna)
+// ============================================================
+
+const COL_DARK = {
+  bg: '#0c1012', panel: '#141a1d', panel2: '#191f23',
+  border: '#262f34', borderSoft: '#1c2327',
+  text: '#e7ecee', textMuted: '#7c8a91',
+  amber: '#ffb454', cyan: '#5fd0d9', magenta: '#d97ef0',
+  green: '#8ed17f', red: '#e8695f',
+  screen: '#0a1210', screenGrid: '#1e3a2e',
+};
+
+const COL_LIGHT = {
+  bg: '#eef1f2', panel: '#ffffff', panel2: '#f2f4f5',
+  border: '#d4dadd', borderSoft: '#e2e7e9',
+  text: '#1a2226', textMuted: '#5c6a71',
+  amber: '#b8710a', cyan: '#0e8a92', magenta: '#a233b5',
+  green: '#25873f', red: '#c0392b',
+  screen: '#f7f9f8', screenGrid: '#cfe0d6',
+};
+
+// Oggetto mutabile: le sue proprietà vengono riscritte a inizio render da LLCDesignTool
+// in base al tema scelto. Tutti i componenti sotto leggono COL.xxx al momento del render
+// (React esegue l'albero in modo sincrono), quindi la mutazione si propaga correttamente.
+const COL = { ...COL_DARK };
+
+function Icon({ children, size = 14, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{children}</svg>
+  );
+}
+const Gauge = p => <Icon {...p}><path d="M12 15l3.5-3.5" /><path d="M20.3 18c.4-1 .7-2.6.7-4a9 9 0 1 0-18 0c0 1.4.3 3 .7 4" /></Icon>;
+const FolderOpen = p => <Icon {...p}><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></Icon>;
+const Save = p => <Icon {...p}><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" /><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7" /><path d="M7 3v4a1 1 0 0 0 1 1h7" /></Icon>;
+const Trash2 = p => <Icon {...p}><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" /></Icon>;
+const XIcon = p => <Icon {...p}><path d="M18 6 6 18" /><path d="m6 6 12 12" /></Icon>;
+const AlertTriangle = p => <Icon {...p}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></Icon>;
+const CheckCircle2 = p => <Icon {...p}><path d="M21.8 10A10 10 0 1 1 17 3.34" /><path d="m9 11 3 3L22 4" /></Icon>;
+const XCircle = p => <Icon {...p}><circle cx="12" cy="12" r="10" /><path d="m15 9-6 6" /><path d="m9 9 6 6" /></Icon>;
+const Radio = p => <Icon {...p}><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9" /><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5" /><circle cx="12" cy="12" r="2" /><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5" /><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19" /></Icon>;
+const Download = p => <Icon {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></Icon>;
+const Upload = p => <Icon {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></Icon>;
+const Sun = p => <Icon {...p}><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" /></Icon>;
+const Moon = p => <Icon {...p}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" /></Icon>;
+const BookOpen = p => <Icon {...p}><path d="M12 7v14" /><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" /></Icon>;
+
+// ============================================================
+// COMPONENTI UI
+// ============================================================
+
+function Field({ label, unit, children, hint }) {
+  return (
+    <label className="block mb-3">
+      <div className="flex items-baseline justify-between mb-1">
+        <span className="text-[11px] uppercase tracking-wider" style={{ color: COL.textMuted }}>{label}</span>
+        {unit && <span className="text-[10px]" style={{ color: COL.textMuted }}>{unit}</span>}
+      </div>
+      {children}
+      {hint && <div className="text-[10px] mt-1" style={{ color: COL.textMuted }}>{hint}</div>}
+    </label>
+  );
+}
+
+function NumInput({ value, onChange, step = 'any' }) {
+  return (
+    <input
+      type="number"
+      value={value}
+      step={step}
+      onChange={e => onChange(e.target.value === '' ? '' : parseFloat(e.target.value))}
+      className="w-full px-2.5 py-1.5 rounded font-mono text-sm outline-none"
+      style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.text }}
+      onFocus={e => e.target.style.borderColor = COL.amber}
+      onBlur={e => e.target.style.borderColor = COL.border}
+    />
+  );
+}
+
+function SectionTitle({ n, children }) {
+  return (
+    <div className="flex items-center gap-2 mb-3 mt-6 first:mt-0">
+      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded" style={{ background: COL.panel2, color: COL.amber, border: `1px solid ${COL.border}` }}>{n}</span>
+      <span className="text-[11px] uppercase tracking-wider font-semibold" style={{ color: COL.textMuted }}>{children}</span>
+      <div className="flex-1 h-px" style={{ background: COL.borderSoft }} />
+    </div>
+  );
+}
+
+function Readout({ label, value, unit, digits = 3, accent, big }) {
+  return (
+    <div className="rounded px-3 py-2" style={{ background: COL.panel2, border: `1px solid ${COL.borderSoft}` }}>
+      <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: COL.textMuted }}>{label}</div>
+      <div className={`font-mono ${big ? 'text-xl' : 'text-base'}`} style={{ color: accent || COL.text }}>
+        {typeof value === 'string' ? value : fmt(value, unit || '', digits)}
+      </div>
+    </div>
+  );
+}
+
+function StatusPill({ ok, textOk, textBad }) {
+  return ok ? (
+    <div className="flex items-center gap-1.5 text-xs font-mono" style={{ color: COL.green }}><CheckCircle2 size={14} /> {textOk}</div>
+  ) : (
+    <div className="flex items-center gap-1.5 text-xs font-mono" style={{ color: COL.red }}><XCircle size={14} /> {textBad}</div>
+  );
+}
+
+// ---------------- Grafico curva di guadagno (SVG nativo) ----------------
+function GainChart({ data, FxMin, MmaxTarget }) {
+  const width = 720, height = 340;
+  const margin = { top: 18, right: 92, bottom: 34, left: 42 };
+  const w = width - margin.left - margin.right;
+  const h = height - margin.top - margin.bottom;
+  const xMin = data[0].fx, xMax = data[data.length - 1].fx;
+  const yMax = Math.max(3, MmaxTarget * 1.5);
+
+  const xScale = fx => margin.left + ((fx - xMin) / (xMax - xMin)) * w;
+  const yScale = k => margin.top + h - (Math.min(Math.max(k, 0), yMax) / yMax) * h;
+  const linePath = key => data.map((d, i) => `${i === 0 ? 'M' : 'L'} ${xScale(d.fx).toFixed(2)} ${yScale(d[key]).toFixed(2)}`).join(' ');
+
+  const [hover, setHover] = useState(null);
+  const step = data.length > 1 ? data[1].fx - data[0].fx : 0.01;
+
+  function handleMove(e) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const px = (e.clientX - rect.left) * (width / rect.width);
+    const fx = xMin + ((px - margin.left) / w) * (xMax - xMin);
+    if (fx < xMin || fx > xMax) { setHover(null); return; }
+    const idx = Math.max(0, Math.min(data.length - 1, Math.round((fx - xMin) / step)));
+    setHover(data[idx]);
+  }
+
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => Number((f * yMax).toFixed(2)));
+  const xTicks = [0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6].filter(v => v >= xMin - 0.01 && v <= xMax + 0.01);
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${width} ${height}`} onMouseMove={handleMove} onMouseLeave={() => setHover(null)} style={{ cursor: 'crosshair', display: 'block' }}>
+      {yTicks.map((t, i) => <line key={'gy' + i} x1={margin.left} x2={width - margin.right} y1={yScale(t)} y2={yScale(t)} stroke={COL.screenGrid} strokeDasharray="2 3" />)}
+      {xTicks.map((t, i) => <line key={'gx' + i} x1={xScale(t)} x2={xScale(t)} y1={margin.top} y2={margin.top + h} stroke={COL.screenGrid} strokeDasharray="2 3" />)}
+
+      {yTicks.map((t, i) => <text key={'ty' + i} x={margin.left - 6} y={yScale(t) + 3} fontSize="9" fill={COL.textMuted} textAnchor="end" fontFamily="monospace">{t}</text>)}
+      {xTicks.map((t, i) => <text key={'tx' + i} x={xScale(t)} y={margin.top + h + 16} fontSize="9" fill={COL.textMuted} textAnchor="middle" fontFamily="monospace">{t.toFixed(1)}</text>)}
+      <text x={margin.left + w / 2} y={height - 4} fontSize="10" fill={COL.textMuted} textAnchor="middle" fontFamily="monospace">Fx = fs / fr</text>
+
+      <line x1={margin.left} x2={width - margin.right} y1={yScale(MmaxTarget)} y2={yScale(MmaxTarget)} stroke={COL.red} strokeDasharray="4 4" />
+      <text x={width - margin.right + 4} y={yScale(MmaxTarget) + 3} fontSize="9" fill={COL.red} fontFamily="monospace">Mmax target</text>
+      <line x1={margin.left} x2={width - margin.right} y1={yScale(1)} y2={yScale(1)} stroke={COL.textMuted} strokeDasharray="4 4" />
+      <text x={width - margin.right + 4} y={yScale(1) + 3} fontSize="9" fill={COL.textMuted} fontFamily="monospace">Mnom=1</text>
+      <line x1={xScale(FxMin)} x2={xScale(FxMin)} y1={margin.top} y2={margin.top + h} stroke={COL.amber} strokeDasharray="2 2" />
+      <text x={xScale(FxMin)} y={margin.top - 6} fontSize="9" fill={COL.amber} textAnchor="middle" fontFamily="monospace">Fx_min</text>
+
+      <path d={linePath('Q0')} fill="none" stroke={COL.cyan} strokeWidth="1.5" />
+      <path d={linePath('Qh')} fill="none" stroke={COL.magenta} strokeWidth="1.5" />
+      <path d={linePath('Qm')} fill="none" stroke={COL.amber} strokeWidth="2" />
+
+      {hover && (
+        <g>
+          <line x1={xScale(hover.fx)} x2={xScale(hover.fx)} y1={margin.top} y2={margin.top + h} stroke={COL.textMuted} strokeWidth="1" />
+          <rect x={margin.left + 6} y={margin.top + 4} width={128} height={56} fill={COL.panel2} opacity="0.94" stroke={COL.border} />
+          <text x={margin.left + 12} y={margin.top + 18} fontSize="9" fill={COL.text} fontFamily="monospace">Fx = {hover.fx.toFixed(3)}</text>
+          <text x={margin.left + 12} y={margin.top + 30} fontSize="9" fill={COL.cyan} fontFamily="monospace">Q≈0: {hover.Q0.toFixed(3)}</text>
+          <text x={margin.left + 12} y={margin.top + 42} fontSize="9" fill={COL.magenta} fontFamily="monospace">Qmax/2: {hover.Qh.toFixed(3)}</text>
+          <text x={margin.left + 12} y={margin.top + 54} fontSize="9" fill={COL.amber} fontFamily="monospace">Qmax: {hover.Qm.toFixed(3)}</text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// ============================================================
+// APP
+// ============================================================
+
+function Formula({ children }) {
+  return (
+    <div className="rounded px-3 py-2 my-2 font-mono text-xs overflow-x-auto" style={{ background: COL.panel2, border: `1px solid ${COL.borderSoft}`, color: COL.cyan }}>
+      {children}
+    </div>
+  );
+}
+function MPara({ children }) {
+  return <p className="text-[13px] leading-relaxed mb-2" style={{ color: COL.text }}>{children}</p>;
+}
+function MList({ items }) {
+  return (
+    <ul className="text-[13px] leading-relaxed mb-2 pl-4 space-y-1" style={{ color: COL.text }}>
+      {items.map((it, i) => <li key={i} style={{ listStyle: 'disc' }}>{it}</li>)}
+    </ul>
+  );
+}
+function MStep({ n, title, children }) {
+  return (
+    <div className="mb-5">
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded" style={{ background: COL.panel2, color: COL.amber, border: `1px solid ${COL.border}` }}>{n}</span>
+        <span className="text-[13px] font-semibold" style={{ color: COL.text }}>{title}</span>
+      </div>
+      <div className="pl-1">{children}</div>
+    </div>
+  );
+}
+
+function MethodologyPanel({ open, onClose }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center p-3 sm:p-8" style={{ background: 'rgba(0,0,0,0.65)' }} onClick={onClose}>
+      <div className="w-full max-w-3xl rounded-lg mt-4 mb-4" style={{ background: COL.panel, border: `1px solid ${COL.border}`, maxHeight: '92vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 shrink-0" style={{ borderBottom: `1px solid ${COL.borderSoft}` }}>
+          <div className="flex items-center gap-2">
+            <BookOpen size={15} color={COL.amber} />
+            <span className="text-[11px] uppercase tracking-wider font-semibold" style={{ color: COL.amber }}>Metodologia di dimensionamento — FHA LLC Half-Bridge</span>
+          </div>
+          <button onClick={onClose} style={{ color: COL.textMuted }}><XIcon size={16} /></button>
+        </div>
+
+        <div className="overflow-y-auto px-5 py-4" style={{ flex: 1 }}>
+
+          <MStep n="ASSUNZIONI" title="Vincoli fissi (non configurabili)">
+            <MList items={[
+              'Topologia primario: half-bridge → guadagno del ponte = 0.5, fisso.',
+              'Raddrizzatore secondario: center-tap / full-wave — 2 diodi, 2 avvolgimenti secondari.',
+              'fr è un dato di progetto in ingresso, non un vincolo calcolato: l\'utente sceglie la frequenza di risonanza in base a densità di potenza/perdite desiderate; fs_min è invece un output.',
+            ]} />
+          </MStep>
+
+          <MStep n="FONDAMENTI" title="Guadagno del convertitore">
+            <MPara>Il guadagno totale è il prodotto di tre termini:</MPara>
+            <Formula>Guadagno totale = Guadagno_ponte (0.5) × K(Fx, m, Q) × (Ns/Np)</Formula>
+            <MPara>dove K è il guadagno del tank risonante nel modello FHA (First Harmonic Approximation) — considera solo la componente fondamentale della tensione quadra applicata al tank:</MPara>
+            <Formula>K(Fx,m,Q) = Fx²(m−1) / √{'{'} (m·Fx²−1)² + Fx²(Fx²−1)²Q²(m−1)² {'}'}</Formula>
+            <MPara>
+              Fx = fs/fr (frequenza normalizzata) · m = (Lm+Lr)/Lr = Lp/Lr · Q = √(Lr/Cr) / Rac.
+              Questa forma è stata verificata numericamente contro l'esempio di progetto dell'Infineon AN 2012-09 (Qmax=0.4, m=6.3 → Fx_min=0.489, K=1.974): a Fx=1 dà sempre K=1 indipendentemente da m e Q, la proprietà caratteristica per cui tutte le curve di guadagno LLC si incrociano alla risonanza.
+            </MPara>
+            <Formula>Rac = (8/π²) · n² · Vout² / Pout       (n = Np/Ns)</Formula>
+            <Formula>fr = 1 / (2π·√(Lr·Cr))   — fissata come input, Lr/Cr scelti di conseguenza</Formula>
+          </MStep>
+
+          <MStep n="01" title="Guadagni richiesti (Mmax, Mmin, Mnom)">
+            <MPara>Il rapporto spire n è fissato imponendo guadagno unitario (K=1, fs=fr) a Vin e Vout nominali:</MPara>
+            <Formula>n = Np/Ns = Vin_nom / (2·(Vout_nom + VF))</Formula>
+            <MPara>Il guadagno richiesto in ciascuna condizione operativa: M = 2·n·Vout / Vin. Condizioni di worst-case:</MPara>
+            <MList items={[
+              'Mmax richiesto → Vin=Vin_min, Vout=Vout_max (max boost)',
+              'Mmin richiesto → Vin=Vin_max, Vout=Vout_min (max buck)',
+              'Mnom → Vin=Vin_nom, Vout=Vout_nom, deve risultare ≈ 1 per costruzione',
+            ]} />
+            <MPara>Se il margine di sicurezza FHA è attivo (compensa la sottostima tipica del modello in zona sotto-risonanza, 10–15%):</MPara>
+            <Formula>Mmax_target = Mmax_richiesto × (1 + margine)</Formula>
+          </MStep>
+
+          <MStep n="02" title="Resistenza di carico riflessa Rac">
+            <MPara>Calcolata al caso peggiore (potenza massima, Vout_max se variabile):</MPara>
+            <Formula>Rac = (8/π²) · n² · Vout_max² / Pout</Formula>
+          </MStep>
+
+          <MStep n="03–05" title="Selezione e iterazione automatica di m">
+            <MPara>Il picco della curva K(Fx, m, Qmax) — punto Fx_min, confine tra funzionamento induttivo (ZVS) e capacitivo — si trova per ricerca del massimo (golden-section search):</MPara>
+            <Formula>Fx_min = argmax_Fx K(Fx, m, Qmax)     Kmax = K(Fx_min, m, Qmax)</Formula>
+            <MPara>m viene poi determinato per bisezione, esplorando il range configurabile [m_min, m_max]: si cerca l'm più alto (quindi la minor corrente di magnetizzazione) tale che Kmax(m) resti appena ≥ Mmax_target, con un margine numerico di sicurezza del 2% contro le approssimazioni del modello. Se anche al limite inferiore del range Kmax risulta insufficiente, il tool segnala l'obiettivo come irraggiungibile.</MPara>
+          </MStep>
+
+          <MStep n="06–07" title="Componenti risonanti e frequenza di switching">
+            <Formula>{`Lr = (Qmax·Rac) / (2π·fr)
+Cr = 1 / (2π·fr·Qmax·Rac)
+Lm = (m−1)·Lr`}</Formula>
+            <Formula>fs_min = Fx_min × fr</Formula>
+            <MPara>Range di switching risultante: [fs_min, fr] per funzionamento in boost (sotto-risonanza).</MPara>
+          </MStep>
+
+          <MStep n="08" title="Dimensionamento trasformatore">
+            <Formula>Np_min = n·(Vout+VF) / (4·fr·Bmax·Ae)</Formula>
+            <MPara>Ns parte da 1 e viene incrementato finché Np = round(n·Ns) ≥ Np_min; n_reale = Np/Ns.</MPara>
+            <Formula>{`I_pri_RMS = √[ (Io/(2√2·n))² + (n·(Vout+VF) / (4√2·fr·Lp))² ]     Lp = Lm+Lr
+I_sec_RMS (per singolo avvolgimento, center-tap) = Io·π/4`}</Formula>
+          </MStep>
+
+          <MStep n="09" title="Stress sui componenti">
+            <MList items={[
+              'MOSFET primario: V blocco = Vin_max · I picco ≈ √2 · I_pri_RMS',
+              'Cr: I RMS = I_pri_RMS · V picco ≈ Vin_max/2 + I_pri_pk/(2π·fr·Cr) — stima approssimata (bias DC + componente AC di picco), da verificare in simulazione',
+              'Diodi raddrizzatori: V inversa picco = 2·(Vout+VF) · I RMS/diodo = Io·π/4',
+            ]} />
+          </MStep>
+
+          <MStep n="10" title="Verifica ZVS">
+            <MPara>Per ogni Q nel range [0, Qmax] (campionato in 10 punti), si verifica che il punto di funzionamento a fs_min resti in regione induttiva:</MPara>
+            <Formula>per ogni Q ∈ [0,Qmax]:  Fx_min(Q,m) ≤ Fx_min(Qmax,m)  →  ZVS garantito</Formula>
+            <MPara>Se il worst-case non è Qmax (cioè un carico più leggero risulta più restrittivo), il tool segnala ZVS non garantito e indica a quale Q si verifica il problema.</MPara>
+          </MStep>
+
+          <MStep n="11" title="Condensatori di uscita">
+            <MPara>Corrente nel condensatore di uscita: corrente raddrizzata a onda intera (D1+D2, sempre ≥0) meno la corrente continua verso il carico:</MPara>
+            <Formula>I_Cout(t) = (π·Io/2)·|sin(ωt)| − Io      ,   ω = 2π·fr</Formula>
+            <MPara>L'RMS è calcolato per integrazione numerica su un periodo T=1/fr (regola del punto medio, 4000 campioni); coincide con la forma chiusa nota in letteratura per il ripple factor di un raddrizzatore a onda intera:</MPara>
+            <Formula>I_Cout_RMS = √[ (1/T)∫₀ᵀ I_Cout(t)² dt ]  =  Io·√(π²/8 − 1) ≈ 0.483·Io</Formula>
+            <Formula>{`N = ⌈ I_Cout_RMS / I_C_rated ⌉
+ΔV_ripple = (ESR_singolo / N) · (π/2)·Io   — ESR_eff × ΔI_picco-picco, dove ΔI_pp = max(I_Cout) − min(I_Cout) = (π/2)·Io`}</Formula>
+          </MStep>
+
+          <MStep n="12" title="Verifica capacità di commutazione ZVS (tempo morto)">
+            <MPara>
+              Il guadagno di tank K(Fx,m,Qmax) verificato allo Step 10 garantisce che il convertitore lavori in regione induttiva, ma non basta da solo: la corrente di magnetizzazione disponibile durante il tempo morto deve anche essere <em>quantitativamente sufficiente</em> a caricare/scaricare le capacità di uscita (Coss) dei due MOSFET del ramo half-bridge, altrimenti lo ZVS non avviene comunque.
+            </MPara>
+            <MPara>Corrente di magnetizzazione di picco (forma triangolare, esposta a un'onda quadra di ampiezza Vin/2):</MPara>
+            <Formula>Im_pk = Vin / (8·Lm·fs)</Formula>
+            <MPara>Criterio: la carica fornita da Im_pk durante il tempo morto deve coprire la carica necessaria a far commutare il nodo di switching (due Coss, ciascuna che deve variare di Vin):</MPara>
+            <Formula>Im_pk · t_dead  ≥  2·Coss·Vin</Formula>
+            <MPara>Sostituendo Im_pk, il termine Vin si semplifica in entrambi i membri — il criterio non dipende quindi dalla tensione di ingresso, solo da Lm, tempo morto, Coss e frequenza di switching. Valutato al caso peggiore fs=fr (la frequenza più alta nel range operativo boost, dove la corrente di magnetizzazione è minima):</MPara>
+            <Formula>Lm_max = t_dead / (16·Coss·fr)</Formula>
+            <MPara>Se l'Lm calcolato allo Step 6 supera questo limite, la corrente di magnetizzazione non basta a garantire ZVS nel tempo morto configurato — servirebbe ridurre Lm (quindi ridurre m), aumentare il tempo morto, o scegliere MOSFET con Coss inferiore.</MPara>
+          </MStep>
+
+          <MStep n="LIMITI" title="Note e limiti del modello">
+            <MList items={[
+              'Il modello FHA considera solo la componente fondamentale della tensione quadra; il guadagno reale sotto-risonanza (fs<fr) è tipicamente superiore del 10–15% rispetto alla previsione — da qui l\'opzione di margine di sicurezza.',
+              'Si assume duty cycle 50% simmetrico; sono trascurati i tempi morti, le non linearità dei semiconduttori e le variazioni parametriche dei componenti magnetici.',
+              'La stima di picco su Cr (Step 9) è approssimata — verificare in simulazione.',
+              'Il criterio ZVS a tempo morto (Step 12) approssima la corrente disponibile con il solo valore di picco della magnetizzante (costante durante il breve tempo morto) e trascura il contributo della corrente risonante; è un criterio conservativo di prima approssimazione, non un calcolo di commutazione esatto.',
+              'Per una validazione definitiva del progetto è raccomandata una verifica tramite simulazione circuitale (SPICE/SIMPLIS) prima della realizzazione fisica.',
+            ]} />
+          </MStep>
+
+          <div className="text-[10px] mt-4 pt-3" style={{ color: COL.textMuted, borderTop: `1px solid ${COL.borderSoft}` }}>
+            Derivata e adattata da: Infineon AN 2012-09 "Resonant LLC Converter: Operation and Design" (Sam Abdel-Rahman) · ON Semiconductor AND90061/D "Half-Bridge LLC Resonant Converter Design Using NCP4390/NCV4390".
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LLCDesignTool() {
+  const [theme, setTheme] = useState(() => {
+    try { return window.localStorage.getItem('llc_theme') || 'dark'; } catch (e) { return 'dark'; }
+  });
+  Object.assign(COL, theme === 'dark' ? COL_DARK : COL_LIGHT);
+  useLayoutEffect(() => {
+    try { window.localStorage.setItem('llc_theme', theme); } catch (e) {}
+    document.body.style.background = COL.bg;
+  }, [theme]);
+
+  const [inp, setInp] = useState({
+    VinNom: 400, VinMin: 360, VinMax: 420,
+    Pout: 1000,
+    voutMode: 'fixed', Vout: 48, VoutNom: 48, VoutMin: 40, VoutMax: 58,
+    fr: 100, Qmax: 0.4,
+    mLo: 1.3, mHi: 20,
+    marginEnabled: true, marginPct: 10,
+    Bmax: 0.3, Ae: 100,
+    rectifier: 'diode',
+    IcRated: 3, ESRsingolo: 0.015,
+    tDeadNs: 100, CossPf: 200,
+  });
+  const upd = (k, v) => setInp(s => ({ ...s, [k]: v }));
+
+  const PROJECTS_KEY = 'llc-projects';
+  const [projects, setProjects] = useState({});
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [activeProjectId, setActiveProjectId] = useState(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [methodologyOpen, setMethodologyOpen] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [statusMsg, setStatusMsg] = useState('');
+  const fileInputRef = React.useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(PROJECTS_KEY);
+        setProjects(res && res.value ? JSON.parse(res.value) : {});
+      } catch (e) {
+        setProjects({});
+      } finally {
+        setProjectsLoaded(true);
+      }
+    })();
+  }, []);
+
+  async function persistProjects(next) {
+    setProjects(next);
+    try {
+      await window.storage.set(PROJECTS_KEY, JSON.stringify(next));
+    } catch (e) {
+      setStatusMsg('Errore nel salvataggio: riprova.');
+    }
+  }
+
+  async function handleSave() {
+    const name = saveName.trim();
+    if (!name) { setStatusMsg('Dai un nome al progetto prima di salvare.'); return; }
+    const id = activeProjectId && projects[activeProjectId] && projects[activeProjectId].name === name
+      ? activeProjectId : `p_${Date.now()}`;
+    const next = { ...projects, [id]: { name, savedAt: Date.now(), inp } };
+    await persistProjects(next);
+    setActiveProjectId(id);
+    setSaveName('');
+    setStatusMsg(`Progetto "${name}" salvato.`);
+  }
+
+  const DEFAULT_INP = {
+    VinNom: 400, VinMin: 360, VinMax: 420,
+    Pout: 1000,
+    voutMode: 'fixed', Vout: 48, VoutNom: 48, VoutMin: 40, VoutMax: 58,
+    fr: 100, Qmax: 0.4, mLo: 1.3, mHi: 20,
+    marginEnabled: true, marginPct: 10,
+    Bmax: 0.3, Ae: 100,
+    rectifier: 'diode',
+    IcRated: 3, ESRsingolo: 0.015,
+    tDeadNs: 100, CossPf: 200,
+  };
+
+  function handleLoad(id) {
+    const p = projects[id];
+    if (!p) return;
+    setInp({ ...DEFAULT_INP, ...p.inp });
+    setActiveProjectId(id);
+    setPanelOpen(false);
+    setStatusMsg(`Progetto "${p.name}" caricato.`);
+  }
+
+  async function handleDelete(id) {
+    const p = projects[id];
+    const next = { ...projects };
+    delete next[id];
+    await persistProjects(next);
+    if (activeProjectId === id) setActiveProjectId(null);
+    setStatusMsg(p ? `Progetto "${p.name}" eliminato.` : '');
+  }
+
+  function handleExport() {
+    const name = (activeProjectId && projects[activeProjectId] ? projects[activeProjectId].name : saveName.trim()) || 'progetto_llc';
+    const payload = { type: 'llc-design-tool-project', name, savedAt: Date.now(), inp };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${name.replace(/[^a-z0-9_\-]+/gi, '_')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setStatusMsg(`File "${a.download}" esportato.`);
+  }
+
+  function handleImportClick() { fileInputRef.current && fileInputRef.current.click(); }
+
+  function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!parsed.inp) throw new Error('Formato file non valido');
+        setInp({ ...DEFAULT_INP, ...parsed.inp });
+        setSaveName(parsed.name || '');
+        setActiveProjectId(null);
+        setStatusMsg(`Progetto "${parsed.name || file.name}" importato da file.`);
+      } catch (err) {
+        setStatusMsg('Impossibile leggere il file: formato non valido.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  useEffect(() => {
+    if (!statusMsg) return;
+    const t = setTimeout(() => setStatusMsg(''), 3500);
+    return () => clearTimeout(t);
+  }, [statusMsg]);
+
+  const projectList = useMemo(() => Object.entries(projects).sort((a, b) => b[1].savedAt - a[1].savedAt), [projects]);
+  const design = useMemo(() => computeDesign(inp), [inp]);
+
+  const capDesign = useMemo(() => {
+    if (!design || design.error) return null;
+    return computeOutputCapDesign(design.Io, design.fr, inp.IcRated, inp.ESRsingolo);
+  }, [design, inp.IcRated, inp.ESRsingolo]);
+
+  const zvsDtCheck = useMemo(() => {
+    if (!design || design.error) return null;
+    return computeDeadtimeZvs(design.Lm, design.fr, inp.VinNom, inp.tDeadNs, inp.CossPf);
+  }, [design, inp.VinNom, inp.tDeadNs, inp.CossPf]);
+
+  const chartData = useMemo(() => {
+    if (!design || design.error) return [];
+    const yClip = Math.max(3, design.MmaxTarget * 1.5) * 1.05;
+    const data = [];
+    for (let fx = 0.35; fx <= 1.7; fx += 0.01) {
+      data.push({
+        fx: Number(fx.toFixed(2)),
+        Q0: Math.min(gainK(fx, design.m, 0.05), yClip),
+        Qh: Math.min(gainK(fx, design.m, design.Qmax / 2), yClip),
+        Qm: Math.min(gainK(fx, design.m, design.Qmax), yClip),
+      });
+    }
+    return data;
+  }, [design]);
+
+  const err = design && design.error;
+
+  return (
+    <div className="min-h-screen w-full" style={{ background: COL.bg, color: COL.text, fontFamily: 'ui-sans-serif, system-ui, -apple-system' }}>
+      <div className="border-b px-4 sm:px-6 py-4" style={{ borderColor: COL.border, background: COL.panel }}>
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-3">
+            <div className="rounded-full p-2" style={{ background: COL.panel2, border: `1px solid ${COL.border}` }}><Gauge size={18} color={COL.amber} /></div>
+            <div>
+              <div className="text-sm font-semibold tracking-wide">
+                LLC Resonant Converter — FHA Design Tool
+                {activeProjectId && projects[activeProjectId] && (
+                  <span className="ml-2 text-[11px] font-mono font-normal" style={{ color: COL.amber }}>· {projects[activeProjectId].name}</span>
+                )}
+              </div>
+              <div className="text-[11px]" style={{ color: COL.textMuted }}>Half-bridge · First Harmonic Approximation · fr come dato di progetto fisso · versione locale (PC)</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {statusMsg && <div className="text-[11px] font-mono px-2 py-1 rounded" style={{ color: COL.green, background: COL.panel2, border: `1px solid ${COL.borderSoft}` }}>{statusMsg}</div>}
+            <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? 'Passa a tema chiaro' : 'Passa a tema scuro'}
+              className="flex items-center justify-center p-1.5 rounded" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.amber }}>
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+            <button onClick={() => setMethodologyOpen(true)} className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.text }}>
+              <BookOpen size={13} /> Metodologia
+            </button>
+            <button onClick={() => setPanelOpen(true)} className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.text }}>
+              <FolderOpen size={13} /> Progetti {projectList.length > 0 && `(${projectList.length})`}
+            </button>
+            <div className="flex items-center gap-2 text-[11px] font-mono px-2.5 py-1 rounded-full" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: err ? COL.red : COL.green }}>
+              <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: err ? COL.red : COL.green }} />
+              {err ? 'ERRORE DI CONVERGENZA' : 'PROGETTO VALIDO'}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <input type="file" accept="application/json" ref={fileInputRef} onChange={handleImportFile} style={{ display: 'none' }} />
+
+      {panelOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-8" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => setPanelOpen(false)}>
+          <div className="w-full max-w-md rounded-lg mt-8" style={{ background: COL.panel, border: `1px solid ${COL.border}` }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${COL.borderSoft}` }}>
+              <span className="text-[11px] uppercase tracking-wider font-semibold" style={{ color: COL.amber }}>Gestione progetti</span>
+              <button onClick={() => setPanelOpen(false)} style={{ color: COL.textMuted }}><XIcon size={16} /></button>
+            </div>
+            <div className="p-4">
+              <div className="text-[11px] uppercase tracking-wider mb-1.5" style={{ color: COL.textMuted }}>Salva configurazione corrente</div>
+              <div className="flex gap-2 mb-2">
+                <input type="text" value={saveName} onChange={e => setSaveName(e.target.value)}
+                  placeholder="Nome progetto (es. Alimentatore 1kW 48V)"
+                  className="flex-1 px-2.5 py-1.5 rounded text-sm outline-none"
+                  style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.text }}
+                  onKeyDown={e => { if (e.key === 'Enter') handleSave(); }} />
+                <button onClick={handleSave} className="flex items-center gap-1.5 px-3 py-1.5 rounded text-[11px] font-mono" style={{ background: COL.panel2, border: `1px solid ${COL.amber}`, color: COL.amber }}>
+                  <Save size={13} /> Salva
+                </button>
+              </div>
+              <div className="flex gap-2 mb-4">
+                <button onClick={handleExport} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-[11px] font-mono" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.cyan }}>
+                  <Download size={13} /> Esporta su file (.json)
+                </button>
+                <button onClick={handleImportClick} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-[11px] font-mono" style={{ background: COL.panel2, border: `1px solid ${COL.border}`, color: COL.cyan }}>
+                  <Upload size={13} /> Importa da file
+                </button>
+              </div>
+
+              <div className="text-[11px] uppercase tracking-wider mb-1.5" style={{ color: COL.textMuted }}>Progetti salvati in questo browser</div>
+              {!projectsLoaded ? (
+                <div className="text-xs" style={{ color: COL.textMuted }}>Caricamento…</div>
+              ) : projectList.length === 0 ? (
+                <div className="text-xs" style={{ color: COL.textMuted }}>Nessun progetto salvato ancora.</div>
+              ) : (
+                <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                  {projectList.map(([id, p]) => (
+                    <div key={id} className="flex items-center justify-between gap-2 rounded px-2.5 py-2" style={{ background: COL.panel2, border: `1px solid ${id === activeProjectId ? COL.amber : COL.borderSoft}` }}>
+                      <div className="min-w-0">
+                        <div className="text-sm truncate">{p.name}</div>
+                        <div className="text-[10px] font-mono" style={{ color: COL.textMuted }}>
+                          {new Date(p.savedAt).toLocaleDateString('it-IT')} {new Date(p.savedAt).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button onClick={() => handleLoad(id)} className="p-1.5 rounded" style={{ background: COL.bg, border: `1px solid ${COL.border}`, color: COL.cyan }} title="Carica"><FolderOpen size={13} /></button>
+                        <button onClick={() => handleDelete(id)} className="p-1.5 rounded" style={{ background: COL.bg, border: `1px solid ${COL.border}`, color: COL.red }} title="Elimina"><Trash2 size={13} /></button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="text-[10px] mt-3" style={{ color: COL.textMuted }}>
+                I progetti "salvati" restano su questo PC e in questo browser (localStorage). Per portarli su un'altra macchina, o come backup sicuro, usa "Esporta su file".
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-5 p-4 sm:p-6">
+        <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}`, height: 'fit-content' }}>
+          <div className="text-[11px] uppercase tracking-wider font-semibold mb-1" style={{ color: COL.amber }}>Parametri di ingresso</div>
+
+          <SectionTitle n="IN">Tensione di ingresso</SectionTitle>
+          <Field label="Vin nominale" unit="V"><NumInput value={inp.VinNom} onChange={v => upd('VinNom', v)} /></Field>
+          <Field label="Vin minima" unit="V"><NumInput value={inp.VinMin} onChange={v => upd('VinMin', v)} /></Field>
+          <Field label="Vin massima" unit="V"><NumInput value={inp.VinMax} onChange={v => upd('VinMax', v)} /></Field>
+
+          <SectionTitle n="OUT">Uscita</SectionTitle>
+          <Field label="Potenza di uscita" unit="W"><NumInput value={inp.Pout} onChange={v => upd('Pout', v)} /></Field>
+
+          <div className="flex gap-1 mb-3 rounded overflow-hidden" style={{ border: `1px solid ${COL.border}` }}>
+            {['fixed', 'variable'].map(mode => (
+              <button key={mode} onClick={() => upd('voutMode', mode)} className="flex-1 py-1.5 text-[11px] font-mono uppercase"
+                style={{ background: inp.voutMode === mode ? COL.panel2 : 'transparent', color: inp.voutMode === mode ? COL.amber : COL.textMuted }}>
+                {mode === 'fixed' ? 'Vout fissa' : 'Vout variabile'}
+              </button>
+            ))}
+          </div>
+
+          {inp.voutMode === 'fixed' ? (
+            <Field label="Vout" unit="V"><NumInput value={inp.Vout} onChange={v => upd('Vout', v)} /></Field>
+          ) : (
+            <>
+              <Field label="Vout nominale" unit="V"><NumInput value={inp.VoutNom} onChange={v => upd('VoutNom', v)} /></Field>
+              <Field label="Vout minima" unit="V"><NumInput value={inp.VoutMin} onChange={v => upd('VoutMin', v)} /></Field>
+              <Field label="Vout massima" unit="V"><NumInput value={inp.VoutMax} onChange={v => upd('VoutMax', v)} /></Field>
+            </>
+          )}
+
+          <Field label="Raddrizzatore secondario">
+            <div className="flex gap-1 rounded overflow-hidden" style={{ border: `1px solid ${COL.border}` }}>
+              {[['diode', 'Diodo (0.7V)'], ['sync', 'Sincrono (0V)']].map(([val, label]) => (
+                <button key={val} onClick={() => upd('rectifier', val)} className="flex-1 py-1.5 text-[11px] font-mono"
+                  style={{ background: inp.rectifier === val ? COL.panel2 : 'transparent', color: inp.rectifier === val ? COL.amber : COL.textMuted }}>{label}</button>
+              ))}
+            </div>
+          </Field>
+
+          <SectionTitle n="RES">Tank risonante</SectionTitle>
+          <Field label="Frequenza di risonanza fr" unit="kHz" hint="Scelta libera in base a densità di potenza/perdite">
+            <NumInput value={inp.fr} onChange={v => upd('fr', v)} />
+          </Field>
+          <Field label="Q max (pieno carico)" hint="Default tipico 0.4">
+            <NumInput value={inp.Qmax} onChange={v => upd('Qmax', v)} step="0.01" />
+          </Field>
+          <Field label="Range di ricerca m (Lp/Lr)" hint="Estremi esplorati dalla bisezione automatica sullo Step 3–5">
+            <div className="flex items-center gap-2">
+              <NumInput value={inp.mLo} onChange={v => upd('mLo', v)} step="0.1" />
+              <span className="text-[11px]" style={{ color: COL.textMuted }}>—</span>
+              <NumInput value={inp.mHi} onChange={v => upd('mHi', v)} step="0.5" />
+            </div>
+          </Field>
+          <Field label="Margine di sicurezza FHA">
+            <div className="flex items-center gap-2">
+              <button onClick={() => upd('marginEnabled', !inp.marginEnabled)} className="px-2.5 py-1.5 rounded text-[11px] font-mono"
+                style={{ background: inp.marginEnabled ? COL.panel2 : 'transparent', border: `1px solid ${COL.border}`, color: inp.marginEnabled ? COL.amber : COL.textMuted }}>
+                {inp.marginEnabled ? 'ATTIVO' : 'DISATTIVO'}
+              </button>
+              {inp.marginEnabled && <div className="flex-1"><NumInput value={inp.marginPct} onChange={v => upd('marginPct', v)} step="1" /></div>}
+            </div>
+          </Field>
+
+          <SectionTitle n="XFMR">Trasformatore</SectionTitle>
+          <Field label="B max nucleo" unit="T" hint="Default tipico 0.2–0.3 T"><NumInput value={inp.Bmax} onChange={v => upd('Bmax', v)} step="0.01" /></Field>
+          <Field label="Ae — area efficace nucleo" unit="mm²"><NumInput value={inp.Ae} onChange={v => upd('Ae', v)} /></Field>
+
+          <SectionTitle n="COUT">Condensatori di uscita</SectionTitle>
+          <Field label="I_C_rated — corrente RMS max singolo condensatore" unit="A" hint="Da datasheet del condensatore scelto">
+            <NumInput value={inp.IcRated} onChange={v => upd('IcRated', v)} step="0.1" />
+          </Field>
+          <Field label="ESR singolo condensatore" unit="Ω" hint="Da datasheet, alla frequenza di interesse">
+            <NumInput value={inp.ESRsingolo} onChange={v => upd('ESRsingolo', v)} step="0.001" />
+          </Field>
+
+          <SectionTitle n="ZVSDT">Verifica ZVS — tempo morto</SectionTitle>
+          <Field label="Tempo morto (dead-time)" unit="ns" hint="Impostato nel driver/microcontrollore">
+            <NumInput value={inp.tDeadNs} onChange={v => upd('tDeadNs', v)} step="1" />
+          </Field>
+          <Field label="Coss singolo MOSFET" unit="pF" hint="Da datasheet, alla Vds di lavoro">
+            <NumInput value={inp.CossPf} onChange={v => upd('CossPf', v)} step="1" />
+          </Field>
+        </div>
+
+        <div className="space-y-4">
+          {err ? (
+            <div className="rounded-lg p-5 flex items-start gap-3" style={{ background: COL.panel, border: `1px solid ${COL.red}` }}>
+              <AlertTriangle color={COL.red} size={20} />
+              <div>
+                <div className="text-sm font-semibold mb-1" style={{ color: COL.red }}>Impossibile completare il dimensionamento</div>
+                <div className="text-sm" style={{ color: COL.textMuted }}>{err}</div>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <SectionTitle n="01–02">Guadagni richiesti &amp; Rac</SectionTitle>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <Readout label="Rapporto spire n" value={fmtN(design.n)} accent={COL.cyan} />
+                  <Readout label="Mmax richiesto" value={fmtN(design.MmaxReq)} />
+                  <Readout label="Mmax target" value={fmtN(design.MmaxTarget)} accent={COL.amber} />
+                  <Readout label="Mmin richiesto" value={fmtN(design.MminReq)} />
+                  <Readout label="Mnom" value={fmtN(design.Mnom)} />
+                  <Readout label="Rac" value={design.Rac} unit="Ω" />
+                  <Readout label="Io (uscita)" value={design.Io} unit="A" />
+                  <Readout label="Kmax ottenuto" value={fmtN(design.Kmax)} accent={COL.green} />
+                </div>
+                {inp.marginEnabled && <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>Margine FHA {inp.marginPct}% applicato: Mmax {fmtN(design.MmaxReq)} → target {fmtN(design.MmaxTarget)}</div>}
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <SectionTitle n="03–05">Iterazione automatica su m</SectionTitle>
+                <div className="text-[11px] mb-3 font-mono" style={{ color: COL.textMuted }}>m = (Lm+Lr) / Lr = Lp / Lr — rapporto tra induttanza primaria totale e induttanza risonante</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <Readout label="m finale" value={fmtN(design.m)} accent={COL.amber} big />
+                  <Readout label="Fx_min (picco)" value={fmtN(design.FxMin)} />
+                  <Readout label="Kmax @ Qmax" value={fmtN(design.Kmax)} />
+                  <Readout label="Margine su target" value={`${(((design.Kmax / design.MmaxTarget) - 1) * 100).toFixed(1)} %`} accent={COL.green} />
+                </div>
+                <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>Convergenza per bisezione su m ∈ [{fmtN(inp.mLo, 1)}, {fmtN(inp.mHi, 1)}]: si cerca l'm più alto (minor corrente di magnetizzazione) tale che Kmax(m) resti ≥ Mmax target con margine numerico ~2%.</div>
+              </div>
+
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <SectionTitle n="06–07">Componenti risonanti &amp; range di switching</SectionTitle>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  <Readout label="Lr" value={design.Lr} unit="H" accent={COL.cyan} big />
+                  <Readout label="Cr" value={design.Cr} unit="F" accent={COL.cyan} big />
+                  <Readout label="Lm" value={design.Lm} unit="H" accent={COL.cyan} big />
+                  <Readout label="Lp = Lm+Lr" value={design.Lp} unit="H" />
+                  <Readout label="fs_min" value={design.fsMin} unit="Hz" accent={COL.amber} />
+                  <Readout label="fr (fissata)" value={design.fr} unit="Hz" />
+                </div>
+                <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>
+                  Range di frequenza di switching risultante: <span className="font-mono" style={{ color: COL.text }}>{fmt(design.fsMin, 'Hz', 3)} ↔ {fmt(design.fr, 'Hz', 3)}</span> (funzionamento boost, sotto-risonanza)
+                </div>
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <SectionTitle n="08">Trasformatore</SectionTitle>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <Readout label="Np" value={design.Np} unit="spire" digits={0} />
+                  <Readout label="Ns" value={design.Ns} unit="spire" digits={0} />
+                  <Readout label="n reale (Np/Ns)" value={fmtN(design.nActual)} accent={COL.cyan} />
+                  <Readout label="Np_min teorico" value={fmtN(design.NpMin, 2)} unit="spire" />
+                  <Readout label="B verificato" value={design.Bcheck} unit="T" accent={design.Bcheck <= inp.Bmax ? COL.green : COL.red} />
+                  <Readout label="I primario RMS" value={design.IpriRMS} unit="A" />
+                  <Readout label="I secondario RMS" value={design.IsecRMS} unit="A" />
+                </div>
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <SectionTitle n="09">Stress sui componenti</SectionTitle>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="rounded p-3" style={{ background: COL.panel2, border: `1px solid ${COL.borderSoft}` }}>
+                    <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: COL.textMuted }}>MOSFET primario</div>
+                    <div className="space-y-1 text-sm font-mono">
+                      <div>V blocco: {fmt(design.VmosfetBlock, 'V', 1)}</div>
+                      <div>I picco: {fmt(design.IpriPk, 'A', 2)}</div>
+                    </div>
+                  </div>
+                  <div className="rounded p-3" style={{ background: COL.panel2, border: `1px solid ${COL.borderSoft}` }}>
+                    <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: COL.textMuted }}>Condensatore Cr</div>
+                    <div className="space-y-1 text-sm font-mono">
+                      <div>I RMS: {fmt(design.IpriRMS, 'A', 2)}</div>
+                      <div>V picco (stima): {fmt(design.VcrPk, 'V', 1)}</div>
+                    </div>
+                    <div className="text-[10px] mt-1.5" style={{ color: COL.textMuted }}>V picco = Vbus/2 + componente AC — stima approssimata, verificare in simulazione</div>
+                  </div>
+                  <div className="rounded p-3" style={{ background: COL.panel2, border: `1px solid ${COL.borderSoft}` }}>
+                    <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: COL.textMuted }}>Diodi raddrizzatori</div>
+                    <div className="space-y-1 text-sm font-mono">
+                      <div>V inversa picco: {fmt(design.VD, 'V', 1)}</div>
+                      <div>I RMS/diodo: {fmt(design.IDrms, 'A', 2)}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${design.zvsOk ? COL.border : COL.red}` }}>
+                <SectionTitle n="10">Verifica ZVS</SectionTitle>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <StatusPill ok={design.zvsOk}
+                    textOk={`ZVS garantito su tutto il range di carico (Q: 0 → ${fmtN(design.Qmax, 2)})`}
+                    textBad={`ZVS NON garantito: a Q=${fmtN(design.worstQ, 2)} il boundary supera Fx_min di progetto`} />
+                  <div className="text-xs font-mono" style={{ color: COL.textMuted }}>margine: {design.zvsMarginPct.toFixed(2)}%</div>
+                </div>
+                <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>Verifica: per ogni Q in [0, Qmax], il punto di funzionamento a fs_min deve restare in regione induttiva (Fx_operativo &gt; Fx_min(Q, m)).</div>
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${capDesign && capDesign.error ? COL.amber : COL.border}` }}>
+                <SectionTitle n="11">Condensatori di uscita</SectionTitle>
+                {capDesign && capDesign.error ? (
+                  <div className="flex items-center gap-1.5 text-xs font-mono" style={{ color: COL.amber }}><AlertTriangle size={14} /> {capDesign.error}</div>
+                ) : capDesign ? (
+                  <>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <Readout label="I_Cout RMS" value={capDesign.IcoutRMS} unit="A" accent={COL.cyan} big />
+                      <Readout label="N condensatori in parallelo" value={capDesign.N} digits={0} accent={COL.amber} big />
+                      <Readout label="ΔV ripple risultante" value={capDesign.dVripple} unit="V" accent={capDesign.dVripple > 0.5 ? COL.red : COL.green} big />
+                    </div>
+                    <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>
+                      I_Cout(t) = (π·Io/2)·|sin(ωt)| − Io (corrente raddrizzata a onda intera, D1+D2), integrata numericamente su un periodo T=1/fr. N = ⌈I_Cout_RMS / I_C_rated⌉. ΔV = (ESR/N)·(π/2)·Io (escursione picco-picco della corrente sul condensatore).
+                    </div>
+                  </>
+                ) : null}
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${zvsDtCheck && !zvsDtCheck.error && !zvsDtCheck.ok ? COL.red : (zvsDtCheck && zvsDtCheck.error ? COL.amber : COL.border)}` }}>
+                <SectionTitle n="12">Verifica capacità di commutazione (ZVS — tempo morto)</SectionTitle>
+                {zvsDtCheck && zvsDtCheck.error ? (
+                  <div className="flex items-center gap-1.5 text-xs font-mono" style={{ color: COL.amber }}><AlertTriangle size={14} /> {zvsDtCheck.error}</div>
+                ) : zvsDtCheck ? (
+                  <>
+                    <StatusPill ok={zvsDtCheck.ok}
+                      textOk={`Corrente di magnetizzazione sufficiente a scaricare le Coss nel tempo morto (margine ${zvsDtCheck.marginPct.toFixed(1)}%)`}
+                      textBad={`Corrente di magnetizzazione insufficiente: servirebbe Lm ≤ ${fmt(zvsDtCheck.LmMax, 'H', 2)} (attuale ${fmt(design.Lm, 'H', 2)})`} />
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-3">
+                      <Readout label="Lm max ammessa (ZVS)" value={zvsDtCheck.LmMax} unit="H" accent={COL.cyan} />
+                      <Readout label="Lm attuale di progetto" value={design.Lm} unit="H" accent={zvsDtCheck.ok ? COL.green : COL.red} />
+                      <Readout label="I magnetizzante di picco @ fr" value={zvsDtCheck.ImPk} unit="A" />
+                    </div>
+                    <div className="text-[11px] mt-2" style={{ color: COL.textMuted }}>
+                      Criterio: Im_pk·t_dead ≥ 2·Coss·Vin, con Im_pk = Vin/(8·Lm·fs). Vin si semplifica → equivale a Lm_max = t_dead / (16·Coss·fr), valutato al caso peggiore fs=fr (frequenza massima nel range operativo boost).
+                    </div>
+                  </>
+                ) : null}
+              </div>
+
+              <div className="rounded-lg p-4" style={{ background: COL.panel, border: `1px solid ${COL.border}` }}>
+                <div className="flex items-center gap-2 mb-3">
+                  <Radio size={14} color={COL.amber} />
+                  <span className="text-[11px] uppercase tracking-wider font-semibold" style={{ color: COL.textMuted }}>Curva di guadagno K(Fx) — m = {fmtN(design.m, 2)} · passa il mouse sul grafico per leggere i valori</span>
+                </div>
+                <div className="rounded p-2" style={{ background: COL.screen, border: `1px solid ${COL.borderSoft}` }}>
+                  <GainChart data={chartData} FxMin={design.FxMin} MmaxTarget={design.MmaxTarget} />
+                </div>
+                <div className="flex gap-4 mt-2 text-[10px] font-mono" style={{ color: COL.textMuted }}>
+                  <span style={{ color: COL.cyan }}>▬ Q≈0 (vuoto)</span>
+                  <span style={{ color: COL.magenta }}>▬ Q=Qmax/2</span>
+                  <span style={{ color: COL.amber }}>▬ Q=Qmax (worst case)</span>
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="text-[10px] px-1" style={{ color: COL.textMuted }}>
+            Modello FHA: valido in prima approssimazione. Guadagno reale sotto-risonanza tipicamente 10–15% superiore alla previsione.
+            Verificare sempre con simulazione circuitale (SPICE/SIMPLIS) prima della realizzazione fisica.
+          </div>
+        </div>
+      </div>
+
+      <MethodologyPanel open={methodologyOpen} onClose={() => setMethodologyOpen(false)} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<LLCDesignTool />);
+</script>
+</body>
+</html>
