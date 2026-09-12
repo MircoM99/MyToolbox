@@ -81,19 +81,23 @@ Lm = (m−1)·Lr
 
 ```
 I_Cout(t) = (π·Io/2)·|sin(ωt)| − Io
-I_Cout_RMS = Io·√(π²/8 − 1) ≈ 0.483·Io        (integrata numericamente, coincide con la forma chiusa nota in letteratura)
+I_Cout_RMS = Io·√(π²/8 − 1) ≈ 0.483·Io
 N = ⌈ I_Cout_RMS / I_C_rated ⌉
-ΔV_ripple = (ESR_singolo/N) · (π/2)·Io          (ESR_eff × escursione picco-picco della corrente)
+ΔV_ripple = (ESR_singolo/N) · (π/2)·Io
 ```
+
+I_Cout_RMS è calcolata per integrazione numerica e coincide con la forma chiusa nota in letteratura per il ripple factor di un raddrizzatore a onda intera. ΔV_ripple è ESR_eff moltiplicato per l'escursione picco-picco della corrente sul condensatore.
 
 **Verifica capacità di commutazione ZVS (tempo morto):**
 
 Il guadagno di tank verificato allo Step 10 garantisce funzionamento in regione induttiva, ma non basta da solo: la corrente di magnetizzazione deve anche essere *quantitativamente sufficiente* a caricare/scaricare le Coss dei due MOSFET durante il tempo morto disponibile.
 
 ```
-Im_pk = Vin / (8·Lm·fs)                          (corrente di magnetizzazione di picco, forma triangolare)
-Im_pk · t_dead ≥ 2·Coss·Vin                       (criterio di carica sufficiente)
+Im_pk = Vin / (8·Lm·fs)
+Im_pk · t_dead ≥ 2·Coss·Vin
 ```
+
+Im_pk è la corrente di magnetizzazione di picco (forma triangolare); il secondo termine è il criterio di carica sufficiente.
 
 Il termine Vin si semplifica in entrambi i membri: il criterio non dipende dalla tensione di ingresso, solo da Lm, tempo morto, Coss e frequenza di switching. Valutato al caso peggiore fs=fr (frequenza più alta nel range operativo boost, dove la magnetizzante è minima):
 
@@ -102,7 +106,6 @@ Lm_max = t_dead / (16·Coss·fr)
 ```
 
 Se Lm (calcolato allo Step 6) supera questo limite, la corrente di magnetizzazione non basta a garantire ZVS nel tempo morto configurato.
-```
 
 L'elenco completo di tutte le formule per ciascuno degli 11 step è consultabile direttamente nel tool tramite il pulsante **Metodologia**.
 
